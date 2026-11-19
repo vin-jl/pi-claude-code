@@ -60,6 +60,65 @@ or store your Claude Code credentials.
 Run `/claude-code-status` in Pi to check that Claude Code is installed and
 logged in.
 
+## Multiple accounts (fork addition)
+
+> This fork ([vin-jl/pi-claude-code](https://github.com/vin-jl/pi-claude-code))
+> adds support for several Claude subscriptions, each with its own Claude Code
+> login, and an optional automatic account router.
+
+Every account is a separate Claude Code config directory. Log each one in once:
+
+```sh
+claude auth login                                          # default account
+CLAUDE_CONFIG_DIR=~/.claude_personal claude auth login     # second account
+```
+
+Then create `claude-code-accounts.json` in Pi's agent directory
+(`~/.pi/agent/` by default, or `$PI_CODING_AGENT_DIR`), or point
+`PI_CLAUDE_CODE_ACCOUNTS_FILE` at it:
+
+```json
+{
+  "default": { "label": "Main" },
+  "accounts": [
+    { "id": "personal", "label": "Personal", "configDir": "~/.claude_personal" }
+  ],
+  "auto": { "order": ["default", "personal"], "cooldownMinutes": 30 }
+}
+```
+
+This registers one provider per account plus the auto router:
+
+| Provider | Uses |
+|---|---|
+| `claude-code/<model>` | the default Claude Code login (unchanged from upstream) |
+| `claude-code-<id>/<model>` | that account's `configDir` login |
+| `claude-code-auto/<model>` | picks an account per conversation |
+
+Pick any of them in `/model`. Without the file, the extension behaves exactly
+like upstream.
+
+### Auto routing
+
+- A conversation stays on one account. Tool follow-ups always stay on the
+  account that started the turn, so prompt caches and thinking signatures
+  remain valid.
+- When an account reports a rate or usage limit, it cools down until the reset
+  time Claude Code reports (or `cooldownMinutes`). New prompts and Pi's
+  automatic retries then move to the next logged-in account in `auto.order`.
+  Enable Pi's retries (`"retry": { "enabled": true }` in settings) so a
+  rate-limited turn is retried on the other account automatically.
+- Usage-credit (billing) errors are never retried automatically; the next
+  prompt you send goes to another account.
+- Switching accounts replays the conversation once and loses the prompt cache.
+- Set `"auto": { "enabled": false }` to hide the auto models.
+
+Commands: `/claude-code-status` lists every account's login and remembered
+limits; `/claude-code-reset-limits` forgets remembered limits.
+
+The usage-credit guard applies to every account. Each account's requests count
+against that account's own subscription limits.
+
 ## Configuration
 
 These environment variables are optional:

@@ -1,6 +1,7 @@
 import { createProvider, type AuthContext, type ProviderEnv } from "@earendil-works/pi-ai";
 import { discoverClaudeModels, getClaudeStatus, LOGIN_HINT, POWERSHELL_ENV } from "./claude-cli.ts";
-import { API_ID, CLAUDE_CODE_MODELS, modelFromDiscovery, PROVIDER_ID } from "./model-catalog.ts";
+import { DEFAULT_ACCOUNT_ID, type ClaudeAccount } from "./accounts.ts";
+import { API_ID, CLAUDE_CODE_MODELS, modelFromDiscovery, PROVIDER_ID, type ClaudeCodeModel } from "./model-catalog.ts";
 import { streamClaudeCode } from "./stream.ts";
 
 const PROVIDER_ENV_NAMES = [
@@ -10,7 +11,9 @@ const PROVIDER_ENV_NAMES = [
   POWERSHELL_ENV,
 ] as const;
 
-async function providerEnvironment(ctx: AuthContext): Promise<ProviderEnv | undefined> {
+const DEFAULT_ACCOUNT: ClaudeAccount = { id: DEFAULT_ACCOUNT_ID, providerId: PROVIDER_ID, label: "Default" };
+
+async function providerEnvironment(ctx: AuthContext, account: ClaudeAccount): Promise<ProviderEnv | undefined> {
   const env: ProviderEnv = {};
   await Promise.all(
     PROVIDER_ENV_NAMES.map(async (name) => {
@@ -18,20 +21,42 @@ async function providerEnvironment(ctx: AuthContext): Promise<ProviderEnv | unde
       if (value !== undefined) env[name] = value;
     }),
   );
+  // An account's own config directory wins over inherited overrides, so every
+  // account always talks to its own Claude Code login.
+  if (account.configDir) {
+    env.PI_CLAUDE_CODE_CONFIG_DIR = account.configDir;
+    env.CLAUDE_CONFIG_DIR = account.configDir;
+  }
   return Object.keys(env).length ? env : undefined;
 }
 
 // Pi resolves provider-scoped settings (such as PI_CLAUDE_CODE_COMMAND) only
-// through auth hooks. Remember the latest values so model discovery and the
-// status command look at the same Claude Code installation as requests do.
-let lastProviderEnv: ProviderEnv | undefined;
+// through auth hooks. Remember the latest values per account so model discovery
+// and the status command look at the same Claude Code login as requests do.
+const lastProviderEnv = new Map<string, ProviderEnv | undefined>();
 
-/** The environment used to locate and configure Claude Code. */
-export function claudeCodeEnv(): Record<string, string | undefined> {
-  return { ...process.env, ...lastProviderEnv };
+/** The environment used to locate and configure Claude Code for one account. */
+export function claudeCodeEnv(account: ClaudeAccount = DEFAULT_ACCOUNT): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...process.env, ...lastProviderEnv.get(account.providerId) };
+  if (account.configDir) {
+    env.PI_CLAUDE_CODE_CONFIG_DIR = account.configDir;
+    env.CLAUDE_CONFIG_DIR = account.configDir;
+  }
+  return env;
 }
 
-export function createClaudeCodeProvider() {
+function forAccount(model: ClaudeCodeModel, account: ClaudeAccount): ClaudeCodeModel {
+  return account.providerId === PROVIDER_ID ? model : { ...model, provider: account.providerId };
+}
+
+export interface ClaudeCodeProviderOptions {
+  account?: ClaudeAccount;
+  /** Provider display name. Defaults to upstream's name for the default account. */
+  name?: string;
+}
+
+export function createClaudeCodeProvider(options: ClaudeCodeProviderOptions = {}) {
+  const account = options.account ?? DEFAULT_ACCOUNT;
   let discoveredIds: Set<string> | undefined;
   const externalOAuthMarker = () => ({
     type: "oauth" as const,
@@ -40,8 +65,8 @@ export function createClaudeCodeProvider() {
     expires: Date.now() + 365 * 24 * 60 * 60 * 1_000,
   });
   return createProvider({
-    id: PROVIDER_ID,
-    name: "Claude Code Subscription (Experimental)",
+    id: account.providerId,
+    name: options.name ?? "Claude Code Subscription (Experimental)",
     baseUrl: "process://claude-code",
     auth: {
       apiKey: {
@@ -50,9 +75,9 @@ export function createClaudeCodeProvider() {
         // Pi can label list-price accounting as "(sub)". Requests still resolve
         // through this ambient method; credentials remain owned by Claude Code.
         async check({ ctx, signal }) {
-          const providerEnv = await providerEnvironment(ctx);
-          lastProviderEnv = providerEnv;
-          const status = await getClaudeStatus(claudeCodeEnv(), signal);
+          const providerEnv = await providerEnvironment(ctx, account);
+          lastProviderEnv.set(account.providerId, providerEnv);
+          const status = await getClaudeStatus(claudeCodeEnv(account), signal);
           // Only report the provider as configured when Claude Code is
           // installed and logged in, so Pi hides its models otherwise.
           if (!status.available || !status.loggedIn) return undefined;
@@ -63,8 +88,8 @@ export function createClaudeCodeProvider() {
         },
         async resolve({ ctx, signal }) {
           signal.throwIfAborted();
-          const providerEnv = await providerEnvironment(ctx);
-          lastProviderEnv = providerEnv;
+          const providerEnv = await providerEnvironment(ctx, account);
+          lastProviderEnv.set(account.providerId, providerEnv);
           return {
             auth: { apiKey: "external-process" },
             env: providerEnv,
@@ -81,11 +106,12 @@ export function createClaudeCodeProvider() {
         async login() {
           throw new Error(
             "Claude Code manages its own login. Run `claude auth login` in a terminal instead; " +
-              "this provider uses it automatically.",
+              "this provider uses it automatically." +
+              (account.configDir ? ` For this account run: CLAUDE_CONFIG_DIR=${JSON.stringify(account.configDir)} claude auth login` : ""),
           );
         },
         async refresh(_credential, signal) {
-          const status = await getClaudeStatus(claudeCodeEnv(), signal);
+          const status = await getClaudeStatus(claudeCodeEnv(account), signal);
           if (!status.subscription) throw new Error(status.detail ?? LOGIN_HINT);
           return externalOAuthMarker();
         },
@@ -94,9 +120,11 @@ export function createClaudeCodeProvider() {
         },
       },
     },
-    models: CLAUDE_CODE_MODELS,
+    models: CLAUDE_CODE_MODELS.map((model) => forAccount(model, account)),
     async fetchModels({ signal }) {
-      const models = (await discoverClaudeModels(claudeCodeEnv(), signal)).map(modelFromDiscovery);
+      const models = (await discoverClaudeModels(claudeCodeEnv(account), signal)).map((info) =>
+        forAccount(modelFromDiscovery(info), account),
+      );
       discoveredIds = new Set(models.map((model) => model.id));
       return models;
     },
