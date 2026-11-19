@@ -5,7 +5,8 @@ import { join } from "node:path";
 import test from "node:test";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { loadAccountsConfig, parseAccountsConfig } from "../src/accounts.ts";
-import { AccountCooldowns, chooseAccount, isAccountLimitError } from "../src/auto-router.ts";
+import { chooseAccount, isAccountLimitError, observeMessage } from "../src/auto-router.ts";
+import { UsageStore, windowsFromRateLimit } from "../src/usage-store.ts";
 import { claudeCodeEnv, createClaudeCodeProvider } from "../src/provider.ts";
 
 test("without a config file only the upstream default account exists", async (t) => {
@@ -103,45 +104,110 @@ test("classifies account limit errors but not ordinary server errors", () => {
   assert.equal(isAccountLimitError(message("a")), false);
 });
 
-test("auto routing sticks to the pinned account and fails over on limits", () => {
-  let now = 1_000_000;
-  const config = parseAccountsConfig(
-    { accounts: [{ id: "personal", configDir: "/p" }], auto: { cooldownMinutes: 5 } },
-    "/",
-  );
-  const cooldowns = new AccountCooldowns(config.auto.cooldownMs, () => now);
-  const all = () => true;
+function twoAccounts(auto: Record<string, unknown> = {}) {
+  return parseAccountsConfig({ accounts: [{ id: "personal", configDir: "/p" }], auto: { cooldownMinutes: 5, ...auto } }, "/");
+}
 
-  assert.equal(chooseAccount(config, cooldowns, undefined, all)?.account.providerId, "claude-code");
-  const pinned = chooseAccount(config, cooldowns, "claude-code-personal", all);
-  assert.deepEqual([pinned?.account.providerId, pinned?.switched], ["claude-code-personal", false]);
-
-  // Limit with a reset time reported by Claude Code (seconds).
-  assert.equal(cooldowns.observe(message("claude-code-personal", "429 rate limit", { resetsAt: now / 1000 + 3600 })), true);
-  const moved = chooseAccount(config, cooldowns, "claude-code-personal", all);
-  assert.deepEqual([moved?.account.providerId, moved?.switched], ["claude-code", true]);
-
-  // A retry excludes the account that just failed.
-  assert.equal(chooseAccount(config, cooldowns, undefined, all, "claude-code")?.account.providerId, "claude-code-personal");
-
-  // Unusable (logged out) accounts are skipped.
-  assert.equal(
-    chooseAccount(config, cooldowns, undefined, (account) => account.id !== "default")?.account.providerId,
-    "claude-code-personal",
-  );
-
-  // Both limited: pick the one that frees up first.
-  cooldowns.observe(message("claude-code", "usage limit reached"));
-  assert.equal(chooseAccount(config, cooldowns, undefined, all)?.account.providerId, "claude-code");
-
-  // Cooldowns expire.
-  now += 2 * 3600_000;
-  assert.equal(chooseAccount(config, cooldowns, "claude-code-personal", all)?.switched, false);
+const usage = (five: number, week: number, now: number) => ({
+  unifiedWindows: {
+    five_hour: { utilization: five, resetsAt: now / 1000 + 3600, status: "allowed" },
+    seven_day: { utilization: week, resetsAt: now / 1000 + 86400, status: "allowed" },
+  },
 });
 
-test("successful responses reporting overage or rejection cool the account down", () => {
-  const cooldowns = new AccountCooldowns(60_000);
-  assert.equal(cooldowns.observe(message("a", undefined, { status: "allowed" })), false);
-  assert.equal(cooldowns.observe(message("a", undefined, { isUsingOverage: true })), true);
-  assert.equal(cooldowns.isCooling("a"), true);
+test("parses Claude Code rate-limit windows", () => {
+  const windows = windowsFromRateLimit({
+    rateLimitType: "seven_day",
+    utilization: 0.8,
+    resetsAt: 1794531600,
+    unifiedWindows: { five_hour: { utilization: 0.71, resetsAt: 1794465000, status: "allowed" } },
+  });
+  assert.deepEqual(windows.five_hour, { utilization: 0.71, resetsAt: 1794465000_000, status: "allowed" });
+  assert.equal(windows.seven_day.utilization, 0.8);
+});
+
+test("spread strategy sends new conversations to the account with most headroom", () => {
+  const now = 1_000_000_000_000;
+  const config = twoAccounts();
+  const store = new UsageStore(undefined, () => now);
+  const all = () => true;
+
+  // Nothing known: configured order wins.
+  assert.equal(chooseAccount(config, store, undefined, all)?.account.providerId, "claude-code");
+
+  observeMessage(store, message("claude-code", undefined, usage(0.6, 0.8, now)), config.auto.cooldownMs, now);
+  observeMessage(store, message("claude-code-personal", undefined, usage(0.2, 0.1, now)), config.auto.cooldownMs, now);
+  assert.equal(chooseAccount(config, store, undefined, all)?.account.providerId, "claude-code-personal");
+
+  // A pinned conversation stays put while its account has headroom.
+  const pinned = chooseAccount(config, store, "claude-code", all);
+  assert.deepEqual([pinned?.account.providerId, pinned?.switched], ["claude-code", false]);
+
+  // Fallback strategy keeps using the first account while it has headroom.
+  assert.equal(chooseAccount(twoAccounts({ strategy: "fallback" }), store, undefined, all)?.account.providerId, "claude-code");
+});
+
+test("a burst of new conversations is split across accounts", () => {
+  const now = 1_000_000_000_000;
+  const config = twoAccounts();
+  const store = new UsageStore(undefined, () => now);
+  const picks: string[] = [];
+  for (let i = 0; i < 6; i++) {
+    const choice = chooseAccount(config, store, undefined, () => true)!;
+    store.recordAssignment(choice.account.providerId);
+    picks.push(choice.account.id);
+  }
+  assert.equal(picks.filter((id) => id === "default").length, 3);
+  assert.equal(picks.filter((id) => id === "personal").length, 3);
+});
+
+test("limits are honoured until reset and shared through the usage file", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-claude-usage-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  let now = 1_000_000_000_000;
+  const file = join(dir, "usage.json");
+  const config = twoAccounts();
+  const processA = new UsageStore(file, () => now);
+  const processB = new UsageStore(file, () => now);
+  const all = () => true;
+
+  const result = observeMessage(
+    processA,
+    message("claude-code-personal", "429 rate limit", { resetsAt: now / 1000 + 3600 }),
+    config.auto.cooldownMs,
+    now,
+  );
+  assert.deepEqual(result, { limited: true, until: now + 3_600_000 });
+
+  // Another process sees the limit immediately, even for a pinned conversation.
+  const moved = chooseAccount(config, processB, "claude-code-personal", all);
+  assert.deepEqual([moved?.account.providerId, moved?.switched], ["claude-code", true]);
+  // A retry excludes the account that failed.
+  assert.equal(chooseAccount(config, processB, undefined, all, "claude-code")?.account.providerId, "claude-code-personal");
+  // Logged-out accounts are skipped.
+  assert.equal(chooseAccount(config, processB, undefined, (a) => a.id !== "default")?.account.providerId, "claude-code-personal");
+
+  // A fresh process (restart) still knows.
+  assert.ok(new UsageStore(file, () => now).limitedUntil("claude-code-personal"));
+
+  // Nearly exhausted windows also trigger a switch.
+  observeMessage(processA, message("claude-code", undefined, usage(0.97, 0.5, now)), config.auto.cooldownMs, now);
+  assert.equal(chooseAccount(config, processB, "claude-code", all)?.account.providerId, "claude-code");
+
+  // Reset times pass: windows count as empty again and the limit expires.
+  now += 2 * 86_400_000;
+  assert.equal(processB.limitedUntil("claude-code-personal"), undefined);
+  assert.equal(processB.pressure("claude-code"), 0);
+  assert.equal(chooseAccount(config, processB, "claude-code-personal", all)?.switched, false);
+});
+
+test("rejected windows and overage use mark the account limited", () => {
+  const now = 1_000_000_000_000;
+  const store = new UsageStore(undefined, () => now);
+  assert.equal(observeMessage(store, message("a", undefined, { status: "allowed" }), 60_000, now).limited, false);
+  assert.equal(observeMessage(store, message("a", undefined, { isUsingOverage: true }), 60_000, now).limited, true);
+  const rejected = {
+    unifiedWindows: { five_hour: { utilization: 1, resetsAt: now / 1000 + 600, status: "rejected" } },
+  };
+  assert.equal(observeMessage(store, message("b", undefined, rejected), 60_000, now).until, now + 600_000);
 });

@@ -100,21 +100,40 @@ like upstream.
 
 ### Auto routing
 
-- A conversation stays on one account. Tool follow-ups always stay on the
-  account that started the turn, so prompt caches and thinking signatures
-  remain valid.
-- When an account reports a rate or usage limit, it cools down until the reset
-  time Claude Code reports (or `cooldownMinutes`). New prompts and Pi's
-  automatic retries then move to the next logged-in account in `auto.order`.
-  Enable Pi's retries (`"retry": { "enabled": true }` in settings) so a
-  rate-limited turn is retried on the other account automatically.
-- Usage-credit (billing) errors are never retried automatically; the next
-  prompt you send goes to another account.
-- Switching accounts replays the conversation once and loses the prompt cache.
-- Set `"auto": { "enabled": false }` to hide the auto models.
+Claude Code reports plan usage with every response: utilization and reset time
+of the 5-hour and weekly windows (the numbers Claude Code's `/usage` and T3
+Code show). The extension records them per account in a shared file,
+`claude-code-usage.json` next to the accounts file, so every Pi process (for
+example every T3 Code thread) routes with the same picture, and it survives
+restarts.
 
-Commands: `/claude-code-status` lists every account's login and remembered
-limits; `/claude-code-reset-limits` forgets remembered limits.
+- **New conversations** go to the account with the most headroom
+  (`"strategy": "spread"`, the default), or to the first account in
+  `auto.order` that still has headroom (`"strategy": "fallback"`).
+  Conversations started in the last 15 minutes count as extra load, so a burst
+  of parallel threads is split across accounts.
+- **A conversation stays on its account**, and tool follow-ups always do, so
+  prompt caches and thinking signatures remain valid. It moves only when its
+  account is limited or a window passes `switchAtPercent` (default 95).
+- **Limits**: a rate/usage-limit error, a rejected window or usage-credit use
+  marks the account limited until Claude Code's reported reset time (or
+  `cooldownMinutes`). Every process sees it immediately. Enable Pi's retries
+  (`"retry": { "enabled": true }`) so a rate-limited turn is retried on the
+  other account automatically. Usage-credit (billing) errors are never retried;
+  the next prompt goes to another account.
+- Switching accounts replays the conversation once and loses the prompt cache.
+- Usage is only learned from responses, so an account that has not been used
+  for a while shows its last known numbers until its reset time passes.
+
+```json
+"auto": { "strategy": "spread", "switchAtPercent": 95, "cooldownMinutes": 30 }
+```
+
+Set `"auto": { "enabled": false }` to hide the auto models, or `"usageFile"` to
+move the shared usage file.
+
+Commands: `/claude-code-status` lists every account's login, 5-hour and weekly
+usage and remembered limits; `/claude-code-reset-limits` forgets remembered limits.
 
 The usage-credit guard applies to every account. Each account's requests count
 against that account's own subscription limits.

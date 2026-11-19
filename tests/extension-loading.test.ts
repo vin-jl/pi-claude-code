@@ -13,6 +13,13 @@ test("loads an installed extension without local peer dependencies", async (t) =
   const directory = await mkdtemp(join(tmpdir(), "pi-claude-code-test-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   await cp(new URL("../src/", import.meta.url), join(directory, "src"), { recursive: true });
+  // Isolate from a real multi-account setup in the developer's agent directory.
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = directory;
+  t.after(() => {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  });
 
   const result = await loadExtensions([join(directory, "src/index.ts")], directory);
   assert.deepEqual(result.errors, []);

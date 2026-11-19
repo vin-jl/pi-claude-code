@@ -15,7 +15,11 @@ export const DEFAULT_ACCOUNT_ID = "default";
 export const AUTO_PROVIDER_ID = "claude-code-auto";
 export const ACCOUNTS_FILE_ENV = "PI_CLAUDE_CODE_ACCOUNTS_FILE";
 export const ACCOUNTS_FILE_NAME = "claude-code-accounts.json";
+export const USAGE_FILE_NAME = "claude-code-usage.json";
 const DEFAULT_COOLDOWN_MINUTES = 30;
+const DEFAULT_SWITCH_AT_PERCENT = 95;
+
+export type AutoStrategy = "spread" | "fallback";
 
 export interface ClaudeAccount {
   /** Short id used in configuration, e.g. `default` or `personal`. */
@@ -37,11 +41,20 @@ export interface AutoRouteConfig {
   /** Provider ids in preference order. */
   order: string[];
   cooldownMs: number;
+  /**
+   * `spread`: new conversations go to the account with the most headroom.
+   * `fallback`: new conversations use the first account in `order` that has headroom.
+   */
+  strategy: AutoStrategy;
+  /** Utilization (0..1) at which an account is treated as exhausted. */
+  switchAt: number;
 }
 
 export interface AccountsConfig {
   accounts: ClaudeAccount[];
   auto: AutoRouteConfig;
+  /** Shared usage file, or undefined to keep usage in memory. */
+  usageFile?: string;
   /** Where the configuration came from, for status output. */
   source?: string;
 }
@@ -55,7 +68,8 @@ interface RawAccount {
 interface RawConfig {
   default?: { label?: unknown; enabled?: unknown };
   accounts?: unknown;
-  auto?: { enabled?: unknown; order?: unknown; cooldownMinutes?: unknown };
+  auto?: { enabled?: unknown; order?: unknown; cooldownMinutes?: unknown; strategy?: unknown; switchAtPercent?: unknown };
+  usageFile?: unknown;
 }
 
 const ACCOUNT_ID = /^[a-z0-9][a-z0-9-]{0,31}$/u;
@@ -125,13 +139,25 @@ export function parseAccountsConfig(raw: unknown, baseDir: string, source?: stri
     throw new Error('"auto.cooldownMinutes" must be a non-negative number');
   }
 
+  const strategy = config.auto?.strategy ?? "spread";
+  if (strategy !== "spread" && strategy !== "fallback") throw new Error('"auto.strategy" must be "spread" or "fallback"');
+  const switchAt = config.auto?.switchAtPercent ?? DEFAULT_SWITCH_AT_PERCENT;
+  if (typeof switchAt !== "number" || !(switchAt > 0 && switchAt <= 100)) {
+    throw new Error('"auto.switchAtPercent" must be a number between 1 and 100');
+  }
+  const usageFile = config.usageFile === undefined ? undefined : nonEmptyString(config.usageFile);
+  if (config.usageFile !== undefined && !usageFile) throw new Error('"usageFile" must be a path');
+
   return {
     accounts,
     auto: {
       enabled: config.auto?.enabled !== false && accounts.length > 1,
       order,
       cooldownMs: (minutes ?? DEFAULT_COOLDOWN_MINUTES) * 60_000,
+      strategy,
+      switchAt: switchAt / 100,
     },
+    usageFile: usageFile ? expandPath(usageFile, baseDir) : undefined,
     source,
   };
 }
@@ -152,6 +178,8 @@ export function loadAccountsConfig(agentDir: string | undefined, env = process.e
     if (configured) throw new Error(`Claude Code accounts file not found: ${path}`);
     return singleAccountConfig();
   }
+  const withUsageFile = (config: AccountsConfig): AccountsConfig =>
+    config.usageFile || !agentDir ? config : { ...config, usageFile: join(agentDir, USAGE_FILE_NAME) };
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(path, "utf8"));
@@ -159,7 +187,7 @@ export function loadAccountsConfig(agentDir: string | undefined, env = process.e
     throw new Error(`Cannot read Claude Code accounts file ${path}: ${error instanceof Error ? error.message : String(error)}`);
   }
   try {
-    return parseAccountsConfig(raw, join(path, ".."), path);
+    return withUsageFile(parseAccountsConfig(raw, join(path, ".."), path));
   } catch (error) {
     throw new Error(`Invalid Claude Code accounts file ${path}: ${error instanceof Error ? error.message : String(error)}`);
   }
