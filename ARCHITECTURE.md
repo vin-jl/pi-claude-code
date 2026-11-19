@@ -35,6 +35,31 @@ environment is unchanged. Inherited auth-token, proxy, Bedrock, Vertex, and
 Foundry overrides are still rejected to avoid silently changing authentication
 or billing.
 
+## Multiple accounts (fork)
+
+`src/accounts.ts` reads `claude-code-accounts.json`. Each account becomes its own
+provider created by `createClaudeCodeProvider({ account })`: the provider id is
+`claude-code` for the default account and `claude-code-<id>` otherwise, its
+models carry that provider id, and its auth hooks pin `CLAUDE_CONFIG_DIR` (and
+`PI_CLAUDE_CODE_CONFIG_DIR`) to the account's directory. The environment used
+for status checks and model discovery is remembered per account, so accounts
+never share discovery or status state. Process reuse is already keyed by a
+fingerprint of the launch environment, so workers are never shared between
+accounts.
+
+`claude-code-auto/<model>` entries are Pi virtual models (`registerVirtualModel`).
+Their `route()` returns a physical `claude-code-*` model per request and stores
+the chosen account as router state on the session branch. Tool continuations
+return `request.previous`; retries exclude the failed account.
+
+`src/usage-store.ts` keeps a JSON file with, per account, the latest
+`unifiedWindows` from Claude Code's `rate_limit_event` (utilization and reset
+time per window), a `limitedUntil` timestamp, and recent conversation
+assignments. A `message_end` handler feeds every Claude Code response into it
+(`observeMessage` in `src/auto-router.ts`). Reads are cached by file mtime;
+writes merge the one changed account into the latest file and replace it
+atomically. `chooseAccount` implements the spread/fallback policy on top.
+
 ## Usage-credit guard
 
 Claude Code emits a `rate_limit_event` for each turn. If it reports

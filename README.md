@@ -6,6 +6,22 @@ routing all Claude model requests through the official Claude Code CLI.
 Pi still handles conversation history, approvals, compaction, and tool
 execution. Claude Code only talks to the model. It never runs tools itself.
 
+> [!NOTE]
+> **This is a fork** of
+> [earendil-works/pi-claude-code](https://github.com/earendil-works/pi-claude-code)
+> that adds:
+>
+> - **Multiple Claude accounts**, each with its own Claude Code login, selectable
+>   in `/model`.
+> - **Automatic account routing** (`claude-code-auto/<model>`) that spreads
+>   conversations across accounts and moves away from accounts that hit their
+>   limits.
+> - **Shared, persistent usage tracking**: 5-hour and weekly plan usage per
+>   account, shared by every Pi process and kept across restarts.
+>
+> Without a `claude-code-accounts.json` file the fork behaves exactly like
+> upstream. See [Multiple accounts](#multiple-accounts-fork-addition).
+
 > [!WARNING]
 > **The future of this extension is uncertain.** Right now it works by running
 > Pi's requests through the official Claude Code CLI in non-interactive mode
@@ -38,11 +54,15 @@ execution. Claude Code only talks to the model. It never runs tools itself.
 ## Installation
 
 ```sh
-pi install https://github.com/earendil-works/pi-claude-code
+pi install https://github.com/vin-jl/pi-claude-code
 ```
 
+(Upstream, without the multi-account features:
+`pi install https://github.com/earendil-works/pi-claude-code`.)
+
 Then pick a model from the **Claude Code Subscription (Experimental)** provider
-in Pi.
+in Pi. With several accounts configured, each provider name ends in the
+account label, for example **Claude Code Subscription (Experimental) · Personal**.
 
 ## Login and logout
 
@@ -62,78 +82,157 @@ logged in.
 
 ## Multiple accounts (fork addition)
 
-> This fork ([vin-jl/pi-claude-code](https://github.com/vin-jl/pi-claude-code))
-> adds support for several Claude subscriptions, each with its own Claude Code
-> login, and an optional automatic account router.
+Use several Claude subscriptions from one Pi installation. Every account is a
+separate Claude Code config directory with its own login; the extension never
+reads or copies the credentials.
 
-Every account is a separate Claude Code config directory. Log each one in once:
+### Setup
 
-```sh
-claude auth login                                          # default account
-CLAUDE_CONFIG_DIR=~/.claude_personal claude auth login     # second account
-```
+1. Log each account in once with Claude Code:
 
-Then create `claude-code-accounts.json` in Pi's agent directory
-(`~/.pi/agent/` by default, or `$PI_CODING_AGENT_DIR`), or point
-`PI_CLAUDE_CODE_ACCOUNTS_FILE` at it:
+   ```sh
+   claude auth login                                          # default account (~/.claude)
+   CLAUDE_CONFIG_DIR=~/.claude_personal claude auth login     # second account
+   ```
 
-```json
-{
-  "default": { "label": "Main" },
-  "accounts": [
-    { "id": "personal", "label": "Personal", "configDir": "~/.claude_personal" }
-  ],
-  "auto": { "order": ["default", "personal"], "cooldownMinutes": 30 }
-}
-```
+   On macOS, Claude Code stores the login in the keychain keyed by the config
+   directory, so different directories really are different logins. Check both
+   with `CLAUDE_CONFIG_DIR=... claude auth status`.
 
-This registers one provider per account plus the auto router:
+2. Create `claude-code-accounts.json` in Pi's agent directory (`~/.pi/agent/`
+   by default, or `$PI_CODING_AGENT_DIR`), or point
+   `PI_CLAUDE_CODE_ACCOUNTS_FILE` at it:
+
+   ```json
+   {
+     "default": { "label": "Main" },
+     "accounts": [
+       { "id": "personal", "label": "Personal", "configDir": "~/.claude_personal" }
+     ],
+     "auto": {
+       "strategy": "spread",
+       "order": ["default", "personal"],
+       "switchAtPercent": 95,
+       "cooldownMinutes": 30
+     }
+   }
+   ```
+
+3. Restart Pi (or `/reload`) and run `/claude-code-status` to confirm every
+   account is logged in.
+
+### Providers
 
 | Provider | Uses |
 |---|---|
 | `claude-code/<model>` | the default Claude Code login (unchanged from upstream) |
 | `claude-code-<id>/<model>` | that account's `configDir` login |
-| `claude-code-auto/<model>` | picks an account per conversation |
+| `claude-code-auto/<model>` | picks an account per conversation (see below) |
 
-Pick any of them in `/model`. Without the file, the extension behaves exactly
-like upstream.
+Pick any of them in `/model`, `--model`, or a client such as T3 Code. A specific
+account never switches: if it hits a limit, the request fails and you choose
+what to do. Only the auto models switch accounts.
+
+### Configuration reference
+
+| Key | Default | Meaning |
+|---|---|---|
+| `default.label` | `"Default"` | Display name of the default Claude Code login. |
+| `default.enabled` | `true` | Set `false` to offer only the accounts listed in `accounts`. |
+| `accounts[].id` | required | Lowercase letters, digits and dashes. The provider becomes `claude-code-<id>`. `default` and `auto` are reserved. |
+| `accounts[].label` | the id | Display name. |
+| `accounts[].configDir` | required | Claude Code config directory. `~` and paths relative to the accounts file are expanded. |
+| `auto.enabled` | `true` with 2+ accounts | Set `false` to hide the `claude-code-auto` models. |
+| `auto.strategy` | `"spread"` | `spread`: new conversations go to the account with the most headroom. `fallback`: use the first account in `order` that still has headroom. |
+| `auto.order` | accounts in file order | Account ids (`default` included) in preference order. Tie-breaker for `spread`, priority for `fallback`. Unlisted accounts are appended. |
+| `auto.switchAtPercent` | `95` | A 5-hour or weekly window at or above this utilization counts as exhausted. |
+| `auto.cooldownMinutes` | `30` | How long an account stays marked limited when Claude Code reports no reset time. |
+| `usageFile` | `claude-code-usage.json` in Pi's agent directory | Where shared usage and limits are stored. |
+
+Environment variables:
+
+- `PI_CLAUDE_CODE_ACCOUNTS_FILE`: path to the accounts file (overrides the
+  agent-directory lookup; a missing file is an error).
+- For a configured account, its `configDir` always wins over
+  `PI_CLAUDE_CODE_CONFIG_DIR` / `CLAUDE_CONFIG_DIR`. The default account still
+  honours them.
+
+An invalid accounts file is reported in Pi and the extension falls back to the
+default account only.
 
 ### Auto routing
 
-Claude Code reports plan usage with every response: utilization and reset time
-of the 5-hour and weekly windows (the numbers Claude Code's `/usage` and T3
-Code show). The extension records them per account in a shared file,
-`claude-code-usage.json` next to the accounts file, so every Pi process (for
-example every T3 Code thread) routes with the same picture, and it survives
-restarts.
+#### Where usage numbers come from
 
-- **New conversations** go to the account with the most headroom
-  (`"strategy": "spread"`, the default), or to the first account in
-  `auto.order` that still has headroom (`"strategy": "fallback"`).
-  Conversations started in the last 15 minutes count as extra load, so a burst
-  of parallel threads is split across accounts.
-- **A conversation stays on its account**, and tool follow-ups always do, so
-  prompt caches and thinking signatures remain valid. It moves only when its
-  account is limited or a window passes `switchAtPercent` (default 95).
-- **Limits**: a rate/usage-limit error, a rejected window or usage-credit use
-  marks the account limited until Claude Code's reported reset time (or
-  `cooldownMinutes`). Every process sees it immediately. Enable Pi's retries
-  (`"retry": { "enabled": true }`) so a rate-limited turn is retried on the
-  other account automatically. Usage-credit (billing) errors are never retried;
-  the next prompt goes to another account.
-- Switching accounts replays the conversation once and loses the prompt cache.
-- Usage is only learned from responses, so an account that has not been used
-  for a while shows its last known numbers until its reset time passes.
+Claude Code reports plan usage with every response (a `rate_limit_event`): the
+utilization and reset time of the 5-hour and weekly windows, the same numbers
+Claude Code's `/usage` and T3 Code show. The extension records them per
+account in the shared usage file. Every Pi process (for example every T3 Code
+thread, which each run their own Pi process) reads and updates that file, so
+all of them route on the same picture, and it survives restarts. Windows whose
+reset time has passed count as empty again.
 
-```json
-"auto": { "strategy": "spread", "switchAtPercent": 95, "cooldownMinutes": 30 }
-```
+#### How an account is chosen
 
-Set `"auto": { "enabled": false }` to hide the auto models, or `"usageFile"` to
-move the shared usage file.
+| Request | Account |
+|---|---|
+| First prompt of a conversation | `spread`: the account with the lowest load (highest 5-hour/weekly utilization, plus a small weight for each conversation started on it in the last 15 minutes). `fallback`: the first account in `order` with headroom. |
+| Later prompts | The conversation's account, unless it is limited or past `switchAtPercent`. |
+| Tool results and other follow-ups | Always the account that answered last, so prompt caches and thinking signatures stay valid. |
+| Automatic retry after an error | Another available account; if none, the same one. |
+| Every account limited or exhausted | The least-used account that is not hard-limited, otherwise the one whose limit resets first. |
 
-Commands: `/claude-code-status` lists every account's login, 5-hour and weekly
-usage and remembered limits; `/claude-code-reset-limits` forgets remembered limits.
+The recent-conversation weight means a burst of parallel threads (for example
+several T3 Code threads opened together) is split across accounts even before
+any usage numbers come back. The conversation's account is stored in the Pi
+session, so resuming a session keeps it.
+
+#### Limits
+
+An account is marked limited, for every process, when:
+
+- a response fails with a rate-limit, usage-limit, 429, quota or billing error,
+- Claude Code reports a window as `rejected` or fully used, or
+- a response was charged to usage credits instead of plan limits.
+
+It stays limited until Claude Code's reported reset time, or `cooldownMinutes`
+if none was reported. What happens to the failed turn:
+
+- **Rate-limit errors** are retried by Pi on the other account, if Pi's retries
+  are enabled (`"retry": { "enabled": true }` in Pi's settings).
+- **Usage-credit (billing) errors** are never retried, so you are not charged
+  again. The next prompt you send goes to another account.
+- Ordinary server errors (overloaded, 5xx) do not mark the account limited;
+  Pi retries them normally.
+
+You see a notice when an account is limited or a conversation is moved, and the
+footer shows the account in use (`claude: auto`, `claude: Personal`, ...).
+
+#### Trade-offs
+
+- Moving a conversation to another account replays it once and loses the
+  prompt cache, so it is slower and uses more quota for that turn.
+- Usage is only learned from responses. An account that has not been used for
+  a while shows its last known numbers until their reset time passes.
+- Concurrent processes write the usage file with atomic replace; two writes at
+  the same instant can drop one sample, which the next response refreshes.
+
+#### Commands
+
+- `/claude-code-status`: every account's login and plan, 5-hour and weekly
+  usage with reset times, remembered limits, the routing strategy and the
+  config and usage file paths. Example:
+
+  ```
+  ✓ Main (pro) → claude-code
+      5h 22% (resets in 3h 10m) · week 54% (resets in 2d 4h)
+  ✓ Personal (pro) → claude-code-personal [/Users/you/.claude_personal]
+      5h 0% · week 0%
+  Auto routing: claude-code-auto/* · spread · order claude-code → claude-code-personal · switch at 95%
+  ```
+
+- `/claude-code-reset-limits`: forget remembered limits so auto routing tries
+  every account again.
 
 The usage-credit guard applies to every account. Each account's requests count
 against that account's own subscription limits.
@@ -200,6 +299,10 @@ overrides for Claude Code.
 ## Limitations
 
 - The extension is experimental.
+- Multi-account auto routing learns usage only from responses, and has been
+  tested against simulated limits, not every real Anthropic limit message. A
+  limit error worded differently may not be retried automatically; the account
+  is still avoided once Claude Code reports the window.
 - Branching, editing earlier messages, or changing settings mid-conversation
   starts a fresh Claude Code process that replays the conversation. The first
   response after that can be slower and may use more quota.
@@ -214,3 +317,23 @@ overrides for Claude Code.
 
 For details on how the extension works internally, see
 [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Development
+
+```sh
+npm ci --ignore-scripts
+npm run check
+npx -y node@22 --experimental-transform-types --test tests/*.test.ts
+```
+
+The test script relies on `--experimental-transform-types`, which Node 26
+removed; run the tests with Node 22 as above. To pull upstream changes:
+
+```sh
+git remote add upstream https://github.com/earendil-works/pi-claude-code.git
+git fetch upstream && git merge upstream/main
+```
+
+Fork-specific code lives in `src/accounts.ts` (configuration),
+`src/usage-store.ts` (shared usage file), `src/auto-router.ts` (routing policy)
+and `src/index.ts` (registration and commands).
